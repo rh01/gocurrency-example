@@ -30,6 +30,7 @@ func main() {
 	)
 	flag.Parse()
 
+	// prepare write to csv.
 	columns := []string{*name, *address, *phone, *email}
 	headers := []string{"name", "address", "phone", "email"}
 	// url and id are added as the first two columns.
@@ -40,36 +41,55 @@ func main() {
 		url string
 		id  int
 	}
-	tasks := make(chan task)
-	go func() {
-		for i := *idLow; i < *idHigh; i++ {
-			tasks <- task{url: fmt.Sprintf(*urlTemplate, i), id: i}
-		}
-		close(tasks)
-	}()
 
-	// create workers and schedule closing results when all work is done.
-	results := make(chan []string)
-	var wg sync.WaitGroup
-	wg.Add(*concurrency)
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	for i := 0; i < *concurrency; i++ {
+	// build pipline model using goroutines.
+	genTasks := func(done <-chan interface{}) <-chan task {
+		taskStream := make(chan task)
 		go func() {
-			defer wg.Done()
-			for t := range tasks {
-				r, err := fetch(t.url, t.id, columns)
-				if err != nil {
-					log.Printf("could not fetch %v: %v", t.url, err)
-					continue
+			defer close(taskStream)
+			for i := *idLow; i < *idHigh; i++ {
+				select {
+				case <-done:
+					return
+				case taskStream <- task{url: fmt.Sprintf(*urlTemplate, i), id: i}:
 				}
-				results <- r
 			}
 		}()
+		return taskStream
 	}
+
+	runTask := func(done <-chan interface{}, taskStream <-chan task, numConcurrency int) <-chan []string {
+		results := make(chan []string)
+		var wg sync.WaitGroup
+		wg.Add(numConcurrency)
+
+		for i := 0; i < numConcurrency; i++ {
+			go func() {
+				defer wg.Done()
+				for t := range taskStream {
+					r, err := fetch(t.url, t.id, columns)
+					if err != nil {
+						log.Printf("could not fetch %v: %v", t.url, err)
+						continue
+					}
+					results <- r
+				}
+			}()
+		}
+
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+		return results
+	}
+
+	var done = make(chan interface{})
+	defer close(done)
+
+	var tasks = genTasks(done)
+
+	results := runTask(done, tasks, *concurrency)
 
 	if err := dumpCSV(*outfile, headers, results); err != nil {
 		log.Printf("could not write to %s: %v", *outfile, err)
